@@ -75,7 +75,7 @@
 //! ## Child webviews
 //!
 //! You can use [`WebView::new_as_child`] or [`WebViewBuilder::new_as_child`] to create the webview as a child inside another window. This is supported on
-//! macOS, Windows and Linux (X11 Only).
+//! macOS, iOS, Windows and Linux (X11 Only).
 //!
 //! ```no_run
 //! # use wry::{WebViewBuilder, raw_window_handle, Rect, dpi::*};
@@ -2144,6 +2144,12 @@ impl WebView {
   /// Shows or hides the webview.
   pub fn set_visible(&self, visible: bool) -> Result<()> {
     self.webview.set_visible(visible)
+  }
+
+  /// Returns whether the webview is visible.
+  #[cfg(any(target_os = "macos", target_os = "ios"))]
+  pub fn is_visible(&self) -> Result<bool> {
+    self.webview.is_visible()
   }
 
   /// Try moving focus to the webview.

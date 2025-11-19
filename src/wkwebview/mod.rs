@@ -39,9 +39,7 @@ use objc2::{
 };
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTitlebarSeparatorStyle, NSView};
-#[cfg(target_os = "macos")]
-use objc2_core_foundation::CGSize;
-use objc2_core_foundation::{CGPoint, CGRect};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
   ns_string, MainThreadMarker, NSArray, NSBundle, NSDate, NSError, NSHTTPCookie,
   NSHTTPCookieDomain, NSHTTPCookieExpires, NSHTTPCookieMaximumAge, NSHTTPCookieName,
@@ -403,12 +401,71 @@ impl InnerWebView {
       };
       #[cfg(target_os = "ios")]
       let webview = {
-        let frame = ns_view.frame();
+        // On iOS, frames are in points (not pixels). We don't need to apply scale factor
+        // because UIKit handles that internally. Just extract the logical coordinates.
+        let (x, y) = attributes
+          .bounds
+          .map(|b| {
+            // Convert Position enum to concrete logical coordinates
+            match b.position {
+              dpi::Position::Logical(pos) => (pos.x as f64, pos.y as f64),
+              dpi::Position::Physical(pos) => {
+                // If physical, convert using view's scale
+                let scale = ns_view.contentScaleFactor();
+                (pos.x as f64 / scale, pos.y as f64 / scale)
+              }
+            }
+          })
+          .unwrap_or((0.0, 0.0));
+
+        let (w, h) = if is_child {
+          attributes
+            .bounds
+            .map(|b| {
+              match b.size {
+                dpi::Size::Logical(size) => (size.width as f64, size.height as f64),
+                dpi::Size::Physical(size) => {
+                  let scale = ns_view.contentScaleFactor();
+                  (size.width as f64 / scale, size.height as f64 / scale)
+                }
+              }
+            })
+        } else {
+          None
+        }
+        .unwrap_or_else(|| {
+          if is_child {
+            let frame = NSView::frame(ns_view);
+            (frame.size.width, frame.size.height)
+          } else {
+            (0.0, 0.0)
+          }
+        });
+
+        // iOS uses UIKit coordinate system with top-left origin, y increasing downward
+        let frame = CGRect {
+          origin: CGPoint::new(x, y),
+          size: if is_child {
+            CGSize::new(w, h)
+          } else {
+            let full_frame = ns_view.frame();
+            full_frame.size
+          },
+        };
+
+        // Debug logging for iOS webview frames
+        #[cfg(debug_assertions)]
+        eprintln!(
+          "[wry iOS] Creating webview with frame: origin=({}, {}), size=({}, {}), is_child={}",
+          frame.origin.x, frame.origin.y, frame.size.width, frame.size.height, is_child
+        );
+
         let webview: Retained<WryWebView> =
           objc2::msg_send![super(webview), initWithFrame: frame, configuration: &**config];
         if let Some((red, green, blue, alpha)) = attributes.background_color {
+          // Set opaque based on alpha value: fully opaque (255) = opaque webview
           // This is required first since the webview color is applied too late.
-          webview.setOpaque(false);
+          webview.setOpaque(alpha == 255);
 
           let color = objc2_ui_kit::UIColor::colorWithRed_green_blue_alpha(
             red as f64 / 255.0,
@@ -417,9 +474,8 @@ impl InnerWebView {
             alpha as f64 / 255.0,
           );
 
-          if !is_child {
-            ns_view.setBackgroundColor(Some(&color));
-          }
+          // Set background color for both parent and child webviews
+          ns_view.setBackgroundColor(Some(&color));
           // This has to be monitored as it may clash with isOpaque = true.
           // The webview background color may also applied too late so actually not that useful.
           webview.setBackgroundColor(Some(&color));
@@ -474,9 +530,15 @@ impl InnerWebView {
       }
       #[cfg(target_os = "ios")]
       {
-        // set all autoresizingmasks
-        webview.setAutoresizingMask(UIViewAutoresizing::from_bits(31).unwrap());
-        // let () = msg_send![webview, setAutoresizingMask: 31];
+        if is_child {
+          // fixed element - no auto-resizing
+          webview.setAutoresizingMask(UIViewAutoresizing::empty());
+        } else {
+          // Auto-resize with parent
+          webview.setAutoresizingMask(
+            UIViewAutoresizing::FlexibleWidth | UIViewAutoresizing::FlexibleHeight,
+          );
+        }
 
         // disable scroll bounce by default
         // https://developer.apple.com/documentation/webkit/wkwebview/1614784-scrollview?language=objc
@@ -651,7 +713,83 @@ r#"Object.defineProperty(window, 'ipc', {
 
       #[cfg(target_os = "ios")]
       {
+        // Ensure parent view doesn't clip subviews
+        ns_view.setClipsToBounds(false);
+
+        // Ensure the webview itself doesn't clip its content
+        webview.setClipsToBounds(true);
+
+        // Make sure the webview is opaque and visible
+        webview.setHidden(false);
+        webview.setUserInteractionEnabled(true);
+
+        // Debug: Check existing subviews BEFORE adding
+        #[cfg(debug_assertions)]
+        {
+          let subviews_before: Retained<objc2_foundation::NSArray<NSView>> = objc2::msg_send![ns_view, subviews];
+          eprintln!("[wry iOS] Subviews BEFORE adding (child={}): {}", is_child, subviews_before.len());
+        }
+
+        // NOTE: For hidden off-screen webviews, no special handling needed
+        // Just let them be added normally at their off-screen position
+
+        // Add webview as subview
         ns_view.addSubview(&webview);
+
+        // For child webviews (hidden off-screen), just add them normally
+        // No need to bring to front or handle z-order since they're hidden
+        if is_child {
+          eprintln!("[wry iOS] Child webview added (hidden off-screen)");
+        }
+
+        // Debug: log the parent view frame and subview count
+        #[cfg(debug_assertions)]
+        {
+          let parent_frame = ns_view.frame();
+          let parent_bounds = ns_view.bounds();
+          let webview_frame = webview.frame();
+          let subviews: Retained<objc2_foundation::NSArray<NSView>> = objc2::msg_send![ns_view, subviews];
+          let subview_count = subviews.len();
+          eprintln!(
+            "[wry iOS] Parent view frame: origin=({}, {}), size=({}, {})",
+            parent_frame.origin.x, parent_frame.origin.y, parent_frame.size.width, parent_frame.size.height
+          );
+          eprintln!(
+            "[wry iOS] Parent view bounds: origin=({}, {}), size=({}, {})",
+            parent_bounds.origin.x, parent_bounds.origin.y, parent_bounds.size.width, parent_bounds.size.height
+          );
+          eprintln!(
+            "[wry iOS] New webview frame: origin=({}, {}), size=({}, {}) [child={}]",
+            webview_frame.origin.x, webview_frame.origin.y, webview_frame.size.width, webview_frame.size.height, is_child
+          );
+          eprintln!("[wry iOS] Total subviews AFTER adding: {}", subview_count);
+          eprintln!("[wry iOS] New webview isHidden: {}, isOpaque: {}", webview.isHidden(), webview.isOpaque());
+
+          // Log ALL subview frames to debug z-order and positioning
+          if subview_count > 1 {
+            eprintln!("[wry iOS] === ALL SUBVIEWS (after everything) ===");
+            for i in 0..subview_count {
+              let subview: Retained<NSView> = objc2::msg_send![&*subviews, objectAtIndex: i];
+              let frame = subview.frame();
+              eprintln!("[wry iOS]   Subview[{}]: origin=({}, {}), size=({}, {})",
+                i, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height);
+            }
+          }
+
+          // Check if window exists and get its bounds
+          if let Some(window) = ns_view.window() {
+            let window_frame = window.frame();
+            let window_bounds = window.bounds();
+            eprintln!(
+              "[wry iOS] Window frame: origin=({}, {}), size=({}, {})",
+              window_frame.origin.x, window_frame.origin.y, window_frame.size.width, window_frame.size.height
+            );
+            eprintln!(
+              "[wry iOS] Window bounds: origin=({}, {}), size=({}, {})",
+              window_bounds.origin.x, window_bounds.origin.y, window_bounds.size.width, window_bounds.size.height
+            );
+          }
+        }
       }
 
       Ok(w)
@@ -911,16 +1049,26 @@ r#"Object.defineProperty(window, 'ipc', {
   pub fn bounds(&self) -> crate::Result<Rect> {
     #[allow(unused_unsafe)]
     unsafe {
-      let parent = self.webview.superview().unwrap();
-      let parent_frame = parent.frame();
       let webview_frame = self.webview.frame();
 
-      Ok(Rect {
-        position: LogicalPosition::new(
+      #[cfg(target_os = "macos")]
+      let position = {
+        let parent = self.webview.superview().unwrap();
+        let parent_frame = parent.frame();
+        LogicalPosition::new(
           webview_frame.origin.x,
           parent_frame.size.height - webview_frame.origin.y - webview_frame.size.height,
         )
-        .into(),
+      };
+
+      #[cfg(target_os = "ios")]
+      let position = {
+        // iOS uses top-left origin, no coordinate conversion needed
+        LogicalPosition::new(webview_frame.origin.x, webview_frame.origin.y)
+      };
+
+      Ok(Rect {
+        position: position.into(),
         size: LogicalSize::new(webview_frame.size.width, webview_frame.size.height).into(),
       })
     }
@@ -944,12 +1092,43 @@ r#"Object.defineProperty(window, 'ipc', {
       }
     }
 
+    #[cfg(target_os = "ios")]
+    if self.is_child {
+      // Convert to points (logical coordinates) for UIKit
+      let (x, y) = match bounds.position {
+        dpi::Position::Logical(pos) => (pos.x as f64, pos.y as f64),
+        dpi::Position::Physical(pos) => {
+          let scale = self.webview.contentScaleFactor();
+          (pos.x as f64 / scale, pos.y as f64 / scale)
+        }
+      };
+
+      let (width, height) = match bounds.size {
+        dpi::Size::Logical(size) => (size.width as f64, size.height as f64),
+        dpi::Size::Physical(size) => {
+          let scale = self.webview.contentScaleFactor();
+          (size.width as f64 / scale, size.height as f64 / scale)
+        }
+      };
+
+      // iOS uses UIKit coordinate system with top-left origin
+      let frame = CGRect {
+        origin: CGPoint::new(x, y),
+        size: CGSize::new(width, height),
+      };
+      self.webview.setFrame(frame);
+    }
+
     Ok(())
   }
 
   pub fn set_visible(&self, visible: bool) -> Result<()> {
     self.webview.setHidden(!visible);
     Ok(())
+  }
+
+  pub fn is_visible(&self) -> Result<bool> {
+    Ok(!self.webview.isHidden())
   }
 
   pub fn focus(&self) -> Result<()> {
